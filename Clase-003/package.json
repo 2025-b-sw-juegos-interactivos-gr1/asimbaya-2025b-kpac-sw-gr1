@@ -1,0 +1,12 @@
+{
+  "name": "clase-003-babylonjs",
+  "version": "1.0.0",
+  "description": "Ejemplo simple para cargar texturas y modelos locales con BabylonJS",
+  "private": true,
+  "scripts": {
+    "start": "http-server -c-1 -p 9000 ."
+  },
+  "devDependencies": {
+    "http-server": "^14.1.1"
+  }
+}
