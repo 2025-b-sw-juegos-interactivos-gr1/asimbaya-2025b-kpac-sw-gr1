@@ -1,0 +1,35 @@
+# .gitignore para el subproyecto Examen-01
+# Ignorar dependencias y artefactos locales de Node dentro de Examen-01
+
+# Node dependencies
+node_modules/
+
+# Logs
+npm-debug.log*
+*.log
+
+# Environment files
+.env
+.env.*.local
+
+# Build / output
+dist/
+build/
+out/
+
+# Cache
+.cache/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# http-server local installation
+npm-debug.log*
+
+# Mac/Windows thumbnail caches
+*.icloud
+
+# If you add editor-specific files, list them here
+# e.g.: .idea/

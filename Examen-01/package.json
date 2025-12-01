@@ -1,0 +1,12 @@
+{
+  "name": "examen-01",
+  "version": "1.0.0",
+  "description": "Estructura inicial clonada de Clase-003",
+  "main": "main.js",
+  "scripts": {
+    "start": "http-server ./ -p 8080"
+  },
+  "devDependencies": {
+    "http-server": "^14.1.1"
+  }
+}
