@@ -1,642 +1,1353 @@
-// `main.js` — esqueleto mínimo para inicializar BabylonJS
-window.addEventListener('DOMContentLoaded', function () {
-    const canvas = document.getElementById('renderCanvas');
-    if (!canvas) {
-        console.error('No se encontró el canvas #renderCanvas');
-        return;
+// main.js
+// Escena base con modelos (player, wheelbarrow, brick) y cámara 3ª persona
+
+// Constantes Globales
+const ACTION_DISTANCE = 2.5; // distancia para interactuar con objetos
+const MAX_BRICKS_ON_WHEELBARROW = 3 // número máximo de ladrillos en la carretilla
+const TARGET_BRICKS = 9; // número de ladrillos a transportar para ganar
+const PICKUP_BATCH_SIZE = 3; // número de ladrillos que se recogen de una vez
+
+window.addEventListener("DOMContentLoaded", function () {
+  const canvas = document.getElementById("renderCanvas");
+  if (!canvas) {
+    console.error("No se encontró el canvas #renderCanvas");
+    return;
+  }
+
+  const engine = new BABYLON.Engine(canvas, true, {
+    preserveDrawingBuffer: true,
+    stencil: true,
+  });
+
+  // ───────────────────── HELPERS DE ESCALADO ─────────────────────
+
+  // Escala un root (Mesh) para que toda su jerarquía tenga una altura targetHeight (en Y),
+  // y recoloca para que la base quede apoyada sobre Y=0.
+  function autoScaleToHeight(root, targetHeight) {
+    const bounds = root.getHierarchyBoundingVectors();
+    if (!bounds) return;
+    const { min, max } = bounds;
+    const size = max.subtract(min);
+    const currentHeight = size.y || 1;
+
+    const scale = targetHeight / currentHeight;
+    root.scaling = new BABYLON.Vector3(scale, scale, scale);
+
+    const bounds2 = root.getHierarchyBoundingVectors();
+    const min2 = bounds2.min;
+    const max2 = bounds2.max;
+    const centerX = (min2.x + max2.x) * 0.5;
+    const centerZ = (min2.z + max2.z) * 0.5;
+
+    // Recentrar en XZ y alinear base a Y=0
+    const offset = new BABYLON.Vector3(centerX, min2.y, centerZ);
+    root.position = root.position.subtract(offset);
+  }
+
+  // Escala un root de forma uniforme para que su lado más largo mida targetSize
+  // y deja su base apoyada en Y=0.
+  function autoScaleToLongest(root, targetSize) {
+    const bounds = root.getHierarchyBoundingVectors();
+    if (!bounds) return;
+    const { min, max } = bounds;
+    const size = max.subtract(min);
+    const longest = Math.max(size.x, size.y, size.z) || 1;
+
+    const scale = targetSize / longest;
+    root.scaling = new BABYLON.Vector3(scale, scale, scale);
+
+    const bounds2 = root.getHierarchyBoundingVectors();
+    const min2 = bounds2.min;
+    const max2 = bounds2.max;
+    const centerX = (min2.x + max2.x) * 0.5;
+    const centerZ = (min2.z + max2.z) * 0.5;
+
+    const offset = new BABYLON.Vector3(centerX, min2.y, centerZ);
+    root.position = root.position.subtract(offset);
+  }
+
+  // ───────────────────── CARGA DE MODELOS GLB ─────────────────────
+
+  function loadModels(scene) {
+    const game = scene.metadata.game;
+    const models = scene.metadata.models;
+
+    // 🧍 PLAYER (glb)
+    BABYLON.SceneLoader.ImportMesh(
+      "",
+      "assets/models/",          // 🔁 ajusta si usas otra carpeta
+      "Worker.glb",       // 🔁 ajusta al nombre real del archivo
+      scene,
+      (meshes, particleSystems, skeletons, animationGroups) => {
+        const root = new BABYLON.Mesh("playerModelRoot", scene);
+        root.isPickable = false;
+
+        meshes.forEach((m) => {
+          m.parent = root;
+          // m.showBoundingBox = true; // DEBUG: mostrar bounding box
+        });
+
+        // Orientar el modelo (suele venir acostado); prueba con X=+90°
+        root.rotation = new BABYLON.Vector3(-Math.PI / 2, 0, 0);
+        // Si lo ves de pie pero mirando hacia atrás, prueba:
+        // root.rotation = new BABYLON.Vector3(Math.PI / 2, Math.PI, 0);
+
+        // Escala para altura "humana" ≈ 1.8
+        autoScaleToHeight(root, 1.8);
+
+        // Colgar el modelo del nodo lógico playerNode
+        root.parent = game.playerNode;
+
+        // Guardar referencias en metadata
+        const animGroups = animationGroups || [];
+        models.playerRoot = root;
+        models.playerAnimGroups = animGroups;
+
+        // Mapeo de animaciones:
+        // Queremos: Idle "neutro" para quieto, Walk para movimiento
+        const byName = (name) =>
+          animGroups.find((ag) => ag.name.toLowerCase().includes(name));
+
+        // Idle: prioridad Idle_Neutral > Idle > cualquier otro con "idle"
+        models.animIdle =
+          byName("idle_neutral") ||
+          byName("idle|") ||                 // "CharacterArmature|Idle"
+          animGroups.find((ag) =>
+            ag.name.toLowerCase().includes("idle")
+          ) ||
+          null;
+
+        // Run: preferimos literalmente "run" antes que Walk
+        models.animWalk =
+          byName("run") ||
+          byName("walk") || // fallback si no hubiera run
+          null;
+
+        models.currentAnim = null;
+
+        // Parar todas las animaciones inicialmente
+        animGroups.forEach((ag) => ag.stop());
+
+        // Sombras
+        const lights = scene.metadata.lights;
+        const shadowGenerator = lights && lights.shadowGenerator;
+        if (shadowGenerator) {
+          meshes.forEach((m) => {
+            shadowGenerator.addShadowCaster(m);
+          });
+        }
+
+        console.log(
+          "Player animations:",
+          models.playerAnimGroups.map((ag) => ag.name)
+        );
+      }
+    );
+
+    // 🛒 WHEELBARROW (glb)
+    BABYLON.SceneLoader.ImportMesh(
+      "",
+      "assets/models/",
+      "Wheelbarrow.glb",  // 🔁 ajusta al nombre real
+      scene,
+      (meshes) => {
+        const root = new BABYLON.Mesh("wheelbarrowModelRoot", scene);
+        root.isPickable = false;
+
+        meshes.forEach((m) => {
+          m.parent = root;
+          // m.showBoundingBox = true; // DEBUG: mostrar bounding box
+        });
+
+        // Orientar la carretilla para que su "frente" coincida con +Z
+        root.rotation = new BABYLON.Vector3(0, -Math.PI / 2, 0);
+        // Si la ves al revés, prueba:
+        // root.rotation = new BABYLON.Vector3(0, Math.PI / 2, 0);
+
+        // Escala a altura aprox 0.6
+        autoScaleToHeight(root, 0.6);
+
+        // Colgar del nodo lógico wheelbarrowNode
+        root.parent = game.wheelbarrowNode;
+
+        models.wheelbarrowRoot = root;
+
+        // Sombras
+        const lights = scene.metadata.lights;
+        const shadowGenerator = lights && lights.shadowGenerator;
+        if (shadowGenerator) {
+          meshes.forEach((m) => {
+            shadowGenerator.addShadowCaster(m);
+          });
+        }
+      }
+    );
+
+    // 🧱 BRICK (plantilla glb)
+    BABYLON.SceneLoader.ImportMesh(
+      "",
+      "assets/models/",
+      "Brick.glb",        // 🔁 ajusta al nombre real
+      scene,
+      (meshes) => {
+        const root = new BABYLON.Mesh("brickTemplateRoot", scene);
+        root.isPickable = false;
+
+        meshes.forEach((m) => {
+          m.parent = root;
+          // m.showBoundingBox = true; // DEBUG: mostrar bounding box
+        });
+
+        // Escalamos según su lado más largo para que "mida" ~0.6
+        autoScaleToLongest(root, 0.6);
+
+        // Opcional: orientar el ladrillo para que su largo quede alineado a Z
+        root.rotation = new BABYLON.Vector3(0, Math.PI / 2, 0);
+
+        // Dejarlo como plantilla invisible (se usará para clonar más adelante)
+        root.setEnabled(false);
+        root.isVisible = false;
+
+        models.brickTemplate = root;
+
+        // Pared decorativa en la zona de entrega
+        buildDecorWall(scene);
+
+        // Pila decorativa en recogida (lo veremos en el siguiente punto)
+        buildPickupDecorStack(scene);
+
+        // Generar ladrillos de recogida
+        spawnPickupBricks(scene);
+
+        // "test": clonar un ladrillo a la derecha del player para visualizarlo
+        // const testBrick = root.clone("testBrick");
+        // testBrick.setEnabled(true);
+        // testBrick.isVisible = true;
+        // testBrick.position = new BABYLON.Vector3(0, 0, 0);
+        // registerBrickShadow(testBrick, scene);
+
+        // Sombras
+        const lights = scene.metadata.lights;
+        const shadowGenerator = lights && lights.shadowGenerator;
+        if (shadowGenerator) {
+          meshes.forEach((m) => {
+            shadowGenerator.addShadowCaster(m);
+          });
+        }
+      }
+    );
+
+    // 🧱 PARED COMPLETA (wall.glb)
+    BABYLON.SceneLoader.ImportMesh(
+      "",
+      "assets/models/",
+      "Brick wall.glb",  // ajusta al nombre real
+      scene,
+      (meshes) => {
+        const models = scene.metadata.models;
+        const game = scene.metadata.game;
+
+        const root = new BABYLON.Mesh("wallTemplateRoot", scene);
+        root.isPickable = false;
+
+        meshes.forEach((m) => {
+          m.parent = root;
+        });
+
+        // Si viene acostada como los otros modelos:
+        // root.rotation = new BABYLON.Vector3(Math.PI / 2, 0, 0);
+
+        // Escala a una altura razonable (por ejemplo 2.4 unidades)
+        autoScaleToHeight(root, 2.4);
+
+        // Aseguramos base en Y=0
+        const hb = root.getHierarchyBoundingVectors();
+        const min = hb.min;
+        root.position.y -= min.y;
+
+        // Hacemos el template invisible
+        root.setEnabled(false);
+        root.isVisible = false;
+
+        models.wallTemplate = root;
+
+        // Sombras
+        const lights = scene.metadata.lights;
+        const shadowGenerator = lights && lights.shadowGenerator;
+        if (shadowGenerator) {
+          meshes.forEach((m) => {
+            shadowGenerator.addShadowCaster(m);
+          });
+        }
+
+        // Crear algunas paredes decorativas en el mapa
+        buildFullDecorWalls(scene);
+      }
+    );
+
+  }
+
+  // ───────────────────── SPAWN DE LADRILLOS ─────────────────────
+
+  function spawnPickupBricks(scene) {
+    const game = scene.metadata.game;
+    const models = scene.metadata.models;
+    if (!game || !models || !models.brickTemplate) return;
+
+    const pickupZone = game.pickupZone;
+    const pickupBricks = game.pickupBricks;
+
+    // Si ya hay ladrillos, no spwanear otra tanda (3)
+    if (pickupBricks.length > 0) return;
+
+    const base = pickupZone.position;
+
+    // 3 posiciones fijas centradas en la zona
+    const offsetX = [-1, 0, 1]; // separación en X siempre dentro de un ancho de 4
+
+    for (let i = 0; i < PICKUP_BATCH_SIZE; i++) {
+      const brick = models.brickTemplate.clone(`pickupBrick_${Date.now()}_${i}`);
+      brick.setEnabled(true);
+      brick.isVisible = true;
+
+      resetBrickTransform(brick, scene);
+
+      // Posicionar en fila
+      brick.position = new BABYLON.Vector3(
+        base.x + offsetX[i], // centrado en la zona
+        0, // sobre el suelo
+        base.z
+      );
+
+      game.pickupBricks.push(brick);
+
+      // Registrar sombra
+      registerBrickShadow(brick, scene);
+    }
+  }
+
+  // ──────── HELPER RESETEAR ROTACION/ESCALA DE LADRILLOS ────────
+
+  function resetBrickTransform(brick, scene) {
+    const models = scene.metadata && scene.metadata.models;
+    if (!models || !models.brickTemplate) return;
+
+    const tpl = models.brickTemplate;
+
+    // Nos aseguramos de no usar quaternions
+    brick.rotationQuaternion = null;
+
+    // Misma escala y orientación que la plantilla
+    brick.scaling.copyFrom(tpl.scaling);
+    brick.rotation.copyFrom(tpl.rotation);
+  }
+
+  // ──────── HELPER FIJAR LADRILLOS SOBRE CARRETILLA ────────
+
+  function layoutBricksOnWheelbarrow(scene) {
+    const game = scene.metadata.game;
+    const models = scene.metadata.models;
+
+    const wheelbarrowNode = game.wheelbarrowNode;
+    const bricksOnWheelbarrow = game.bricksOnWheelbarrow;
+
+    if (!wheelbarrowNode || !bricksOnWheelbarrow) return;
+
+    // Slots fijos en espacio LOCAL de la carretilla
+    const slots = [
+      new BABYLON.Vector3(1.35, 0.4, 0.75),  // abajo
+      new BABYLON.Vector3(1.35, 0.55, 0.8),  // centro
+      new BABYLON.Vector3(1.35, 0.70, 0.85),  // arriba
+    ];
+
+    bricksOnWheelbarrow.forEach((brick, i) => {
+      if (!brick) return;
+
+      // Aseguramos parent, orientación y escala consistentes
+      brick.setParent(wheelbarrowNode);
+      resetBrickTransform(brick, scene);
+
+      const idx = Math.min(i, slots.length - 1);
+      brick.position.copyFrom(slots[idx]);  // posición local al wheelbarrow
+    });
+  }
+
+  // ──────── HELPER PARED Y PILA DECORATIVAS ────────
+
+  // Pared decorativa en zona de entrega
+  function buildDecorWall(scene) {
+    const game = scene.metadata.game;
+    const models = scene.metadata.models;
+    if (!models.brickTemplate) return;
+
+    const dropZone = game.dropZone;
+    const baseX = dropZone.position.x + 3; // pared un poco "detrás"
+    const baseZ = dropZone.position.z - 2.75;
+
+    const bricksPerRow = 5; // número de ladrillos por fila
+    const rows = 9; // número de filas
+    const rowHeight = 0.175; // altura entre filas de ladrillos
+    const colStep = 0.62; // separación horizontal
+
+
+    game.decorWallBricks = [];
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < bricksPerRow; c++) {
+        const brick = models.brickTemplate.clone(
+          `decorWallBrick_${r}_${c}_${Date.now()}`
+        );
+        brick.setEnabled(true);
+        brick.isVisible = true;
+        brick.setParent(null);
+        resetBrickTransform(brick, scene);
+
+        const colIndex = c - Math.floor((bricksPerRow - 1) / 2); // centrados
+
+        brick.position = new BABYLON.Vector3(
+          baseX,
+          r * rowHeight,
+          baseZ + colIndex * colStep
+        );
+
+        game.decorWallBricks.push(brick);
+
+        registerBrickShadow(brick, scene);
+      }
+    }
+  }
+
+  // Pila decorativa en zona de recogida
+  function buildPickupDecorStack(scene) {
+    const game = scene.metadata.game;
+    const models = scene.metadata.models;
+    if (!models.brickTemplate) return;
+
+    const pickupZone = game.pickupZone;
+    const base = pickupZone.position;
+
+    game.pickupDecorBricks = [];
+
+    const width = 8;   // ladrillos en X
+    const depth = 5;   // ladrillos en Z (fondo)
+    const height = 3;  // filas en Y
+
+    const colStep = 0.65; // separación en X
+    const depthStep = 0.65;
+    const rowHeight = 0.175;
+
+    for (let y = 0; y < height; y++) {
+      for (let z = 0; z < depth; z++) {
+        for (let x = 0; x < width; x++) {
+          const brick = models.brickTemplate.clone(
+            `pickupDecor_${x}_${y}_${z}_${Date.now()}`
+          );
+          brick.setEnabled(true);
+          brick.isVisible = true;
+          brick.setParent(null);
+          resetBrickTransform(brick, scene);
+
+          const offsetX = -(x - 1) * colStep; // -1, 0, +1
+          const offsetZ = (z + 2) * depthStep; // hacia "adelante" en -Z
+
+          brick.position = new BABYLON.Vector3(
+            base.x + offsetX,
+            y * rowHeight,
+            base.z + offsetZ
+          );
+
+          game.pickupDecorBricks.push(brick);
+
+          registerBrickShadow(brick, scene);
+        }
+      }
+    }
+  }
+
+  // Construir varias paredes decorativas en el mapa
+  function buildFullDecorWalls(scene) {
+    const game = scene.metadata.game;
+    const models = scene.metadata.models;
+    if (!models.wallTemplate) return;
+
+    const walls = [];
+
+    // Configs de posiciones y rotaciones
+    const configs = [
+      {
+        // Una pared al fondo detrás de la zona de entrega
+        position: new BABYLON.Vector3(
+          game.dropZone.position.x + 2,
+          0,
+          game.dropZone.position.z - 2
+        ),
+        rotationY: Math.PI / 2,
+      },
+      {
+        // Otra pared lateral izquierda del mapa
+        position: new BABYLON.Vector3(-8, 0, -4),
+        rotationY: 0,
+      },
+      {
+        // Otra pared lateral derecha del mapa
+        position: new BABYLON.Vector3(8, 0, 6),
+        rotationY: Math.PI,
+      },
+    ];
+
+    configs.forEach((cfg, i) => {
+      const wall = models.wallTemplate.clone(`decorFullWall_${i}`);
+      wall.setEnabled(true);
+      wall.isVisible = true;
+      wall.setParent(null);
+
+      wall.position.copyFrom(cfg.position);
+      wall.rotation.y = cfg.rotationY;
+
+      walls.push(wall);
+
+      // Que también proyecten sombra
+      const lights = scene.metadata.lights;
+      const shadowGenerator = lights && lights.shadowGenerator;
+      if (shadowGenerator) {
+        wall.getChildMeshes().forEach((m) => {
+          shadowGenerator.addShadowCaster(m);
+        });
+      }
+    });
+
+    game.decorFullWalls = walls;
+  }
+
+  // ──────── HELPER LIMITES ────────
+  const WORLD_LIMIT = 18; // límite en X/Z (suelo de 40 → margen de 2)
+  const PLAYER_RADIUS = 0.7;
+  const WHEELBARROW_RADIUS = 0.5;
+  // const BRICK_RADIUS = 0.1;
+
+  function canMovePlayerTo(newPos, scene) {
+    const game = scene.metadata.game;
+    const state = game.state;
+
+    // 1) Limite del mundo (no salir del suelo)
+    if (
+      Math.abs(newPos.x) > WORLD_LIMIT ||
+      Math.abs(newPos.z) > WORLD_LIMIT
+    ) {
+      return false;
     }
 
-    const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
-
-    const createScene = function () {
-        const scene = new BABYLON.Scene(engine);
-
-
-        // *** CONSTANTES DEL JUEGO ***
-        const MOVE_SPEED = 0.08;            // Velocidad (base) de movimiento del player
-        const MOVE_SPEED_PUSHING = 0.05;    // Más lento con carretilla
-        const ACTION_DISTANCE = 2.0;        // radio de acción para recoger/entregar
-        const TARGET_BRICKS = 9;            // Número de ladrillos a entregar para ganar
-        const BATCH_SIZE = 3;               // Número de ladrillos que se pueden llevar a la vez
-        const MAX_BRICKS_ON_WHEELBARROW = 3; // Capacidad máxima de la carretilla
-        const ROT_SPEED = 0.04;            // Velocidad de rotación del player
-
-        // *** LIMITES DEL MUNDO ***
-        const WORLD_BOUNDS = {
-            minX: -14,
-            maxX: 7.5, // Limite frontal (pared) antes de la zona de entrega X = 8
-            minZ: -9,
-            maxZ: 9
-        };
-
-
-        // Color de fondo (Cielo Claro)
-        scene.clearColor = new BABYLON.Color4(0.8, 0.9, 1.0, 1.0);
-
-        // ** CAMARAS **
-        //Vista general Tipo "dron" sobre toda la obra (3ra persona)
-        const camera = new BABYLON.ArcRotateCamera(
-            'camera',
-            Math.PI * 1.3, // Angulo alfa (Horizontal)
-            Math.PI / 3,   // Angulo beta (Vertical)
-            30,            // Distancia desde el objetivo
-            new BABYLON.Vector3(0, 2, 0), // Objetivo de la cámara
-            scene
-        );
-        camera.lowerRadiusLimit = 10; // Distancia mínima
-        camera.upperRadiusLimit = 50; // Distancia máxima
-        camera.attachControl(canvas, true);
-
-        // *** LUCES ***
-        const hemiLight = new BABYLON.HemisphericLight(
-            'hemiLight',
-            new BABYLON.Vector3(0, 1, 0), // Dirección hacia arriba
-            scene
-        );
-        hemiLight.intensity = 0.9; // Intensidad de la luz hemisférica
-
-        const dirLight = new BABYLON.DirectionalLight(
-            'dirLight',
-            new BABYLON.Vector3(-0.5, -1, -0.3), // Dirección de la luz
-            scene
-        );
-        dirLight.intensity = 0.4; // Intensidad de la luz direccional
-
-        // *** MATERIALES ***
-        // Suelo tipo Concreto
-        const groundMat = new BABYLON.StandardMaterial('GroundMat', scene);
-        groundMat.diffuseColor = new BABYLON.Color3(0.75, 0.75, 0.75);
-
-        // Player (Caja amarilla * Temporal) TODO: Reemplazar por modelo 3D
-        const playerMat = new BABYLON.StandardMaterial('PlayerMat', scene);
-        playerMat.diffuseColor = new BABYLON.Color3(1, 0.85, 0.2);
-
-        // Zona de recogida (amarillo/naranja traslúcido)
-        const pickupZoneMat = new BABYLON.StandardMaterial('PickupZoneMat', scene);
-        pickupZoneMat.diffuseColor = new BABYLON.Color3(0.95, 0.7, 0.2);
-        pickupZoneMat.alpha = 0.4;
-
-        // Zona de entrega (verde traslúcido)
-        const dropoffZoneMat = new BABYLON.StandardMaterial('DropoffZoneMat', scene);
-        dropoffZoneMat.diffuseColor = new BABYLON.Color3(0.2, 0.8, 0.3);
-        dropoffZoneMat.alpha = 0.4;
-
-        // Ladrillos
-        const brickMat = new BABYLON.StandardMaterial('BrickMat', scene);
-        brickMat.diffuseColor = new BABYLON.Color3(0.8, 0.3, 0.15);
-
-        // Muro en Construcción
-        const wallMat = new BABYLON.StandardMaterial('WallMat', scene);
-        wallMat.diffuseColor = new BABYLON.Color3(0.7, 0.35, 0.2);
-
-        // Carretilla (wheelbarrow / Caja roja * Temporal) - TODO: Añadir modelo 3D
-        const wheelbarrowMat = new BABYLON.StandardMaterial('WheelbarrowMat', scene);
-        wheelbarrowMat.diffuseColor = new BABYLON.Color3(1, 0.1, 0.1);
-
-
-        // *** GEOMETRÍA DE LA ESCENA ***
-        // Suelo principal
-        const ground = BABYLON.MeshBuilder.CreateGround('ground', {
-            width: 30,
-            height: 20,
-        }, scene);
-        ground.material = groundMat;
-
-        // Player (Caja amarilla * Temporal)
-        const player = BABYLON.MeshBuilder.CreateBox('player', {
-            width: 1,
-            height: 1.8,
-            depth: 1
-        }, scene);
-        player.position = new BABYLON.Vector3(0, 0.9, -4); // Posición inicial del player
-        player.material = playerMat;
-
-        // Zona de recogida: pila de ladrillos 
-        const pickupZone = BABYLON.MeshBuilder.CreateBox('pickupZone', {
-            width: 4,
-            height: 0.1,
-            depth: 3
-        }, scene);
-        pickupZone.position = new BABYLON.Vector3(-8, 0.05, 0); // Posición de la zona de recogida
-        pickupZone.material = pickupZoneMat;
-
-        // // Ladrillo "activo" que se utilizará para la recogida y entrega
-        // const activeBrick = BABYLON.MeshBuilder.CreateBox('activeBrick',{
-        //     width: 0.6,
-        //     height: 0.3,
-        //     depth: 0.3
-        // }, scene);
-        // activeBrick.material = brickMat;
-        // activeBrick.position = new BABYLON.Vector3(-8, 0.15, 0); // Posición inicial en la zona de recogida
-
-        // // Ladrillos disponibles para recoger (maximo 3)
-        // const bricksCount = 3;
-        // for (let i = 0; i < bricksCount; i++) {
-        //     const brick = BABYLON.MeshBuilder.CreateBox(`pickupBrick_${i}`, {
-        //         width: 0.6,
-        //         height: 0.3,
-        //         depth: 0.3
-        //     }, scene);
-        //     brick.material = brickMat;
-
-        //     brick.position = new BABYLON.Vector3(
-        //         -8 + (i - 1) * 0.7,
-        //         0.15,
-        //         0
-        //     );
-        //     pickupBricks.push(brick);
-        // }
-
-        // Carretilla (wheelbarrow) - Caja roja * Temporal
-        const wheelbarrow = BABYLON.MeshBuilder.CreateBox('wheelbarrow', {
-            width: 1.8,
-            height: 0.6,
-            depth: 1.2
-        }, scene);
-        wheelbarrow.material = wheelbarrowMat;
-        wheelbarrow.position = new BABYLON.Vector3(-4, 0.3, -1); // Posición inicial de la carretilla
-
-
-        // Extra ladrillos en zona de recogida "decoración"
-        const pileBricks = [];
-        for (let z = 0; z <= 5; z++) {
-            for (let y = 0; y < 2; y++) {
-                for (let x = -1; x <= 1; x++) {
-                    const decoBrick = BABYLON.MeshBuilder.CreateBox('pileBrick', {
-                        width: 0.6,
-                        height: 0.3,
-                        depth: 0.3
-                    }, scene);
-                    decoBrick.material = brickMat;
-                    decoBrick.position = new BABYLON.Vector3(-8 + x * 0.7, 0.15 + y * 0.32, 0.5 + z * 0.35);
-                    pileBricks.push(decoBrick);
-                }
-            }
-        }
-
-
-
-
-        // Muro en construcción: filas de ladrillos ya colocados
-        const wallBricks = [];
-        const baseWallX = 8;        // x central del muro
-        const baseWallZ = 1.5;      // z del muro (centro)
-        const wallStep = 0.65;      // separación entre ladrillos en z
-        const baseWallY = 0.15;     // altura del primer ladrillo (base)
-        const wallRowHeight = 0.32; // altura entre filas de ladrillos
-
-        // 3 filas x 5 columnas de ladrillos a lo largo del eje Z
-        for (let row = 0; row < 3; row++) {
-            for (let col = 0; col < 5; col++) {
-                const wb = BABYLON.MeshBuilder.CreateBox('wallBrick_${row}_${col}', {
-                    width: 0.6,
-                    height: 0.3,
-                    depth: 0.3
-                }, scene);
-                wb.material = wallMat;
-
-                wb.position = new BABYLON.Vector3(
-                    baseWallX,
-                    baseWallY + row * wallRowHeight,
-                    baseWallZ + (col - 2) * wallStep
-                );
-                wb.rotation.y = Math.PI / 2; // Girar 90 grados para alinear con el muro
-                wallBricks.push(wb);
-            }
-        }
-
-        // La pared OBJETIVO a continuación de la ya construida
-        // Config de la pared OBJETIVO empezando de la última col decorativa (col = 2)
-        const deliveredStartZ = baseWallZ + (2 + 1) * wallStep; // un paso más allá del último ladrillo (col = 3 en adelante)
-
-        // Zona de entrega: punto central para dejar los ladrillos
-        const CenterDeliveredZ = deliveredStartZ + wallStep; // centro de las 3 columnas (col = 0..2)
-
-        // Zona de entrega: área delimitada frente al muro
-        const dropoffZone = BABYLON.MeshBuilder.CreateBox('dropoffZone', {
-            width: 4,
-            height: 0.1,
-            depth: 3
-        }, scene);
-        dropoffZone.position = new BABYLON.Vector3(
-            baseWallX - 1.5, // un poco adelantado respecto al muro
-            0.05,
-            CenterDeliveredZ
-        );
-        dropoffZone.material = dropoffZoneMat;
-
-
-        // *** ESTRUCTURAS DE ESTADO ***
-        const pickupBricks = []; // Ladrillos disponibles para recoger
-        const bricksOnWheelbarrow = []; // Ladrillos actualmente en la carretilla
-        const deliveredBricks = []; // Ladrillos ya entregados en la zona de entrega
-
-        const state = {
-            isPushingWheelbarrow: false,
-            isGameOver: false,
-            targetBricks: TARGET_BRICKS,
-            batchSize: BATCH_SIZE,
-            maxBricksOnWheelbarrow: MAX_BRICKS_ON_WHEELBARROW,
-            totalDelivered: 0,
-            brickIdCounter: 0
-        };
-
-        // ** METADATA PARA LA LÓGICA DEL JUEGO **
-        //Referencias ordenadas para la siguiente fase del desarrollo
-        // (movimiento, colisiones, etc.)
-        scene.metadata = scene.metadata || {};
-        scene.metadata = {
-            game: {
-                player,
-                ground,
-                pickupZone,
-                dropoffZone,
-                //activeBrick,
-                pileBricks,
-                wallBricks,
-                // Referencias necesarias para la lógica de juego
-                pickupBricks, // pila de ladrillos disponibles
-                wheelbarrow,  // referencia a la carretilla
-                bricksOnWheelbarrow,
-                deliveredBricks,
-                state,
-                deliveredWallConfig: {
-                    baseX: baseWallX,          // X fijo de TODA la pared (decorativa+objetivo)
-                    startZ: deliveredStartZ,   // Z donde empieza el muro construido
-                    bricksPerRow: 3,           // 3 columnas en Z
-                    baseY: baseWallY,
-                    rowHeight: wallRowHeight,
-                    colStep: wallStep
-                }
-                // TODO: Añadir limites del mapa, camara, extras, etc.
-            },
-            ui: {}
-        };
-
-
-        // ** HUD (GUI) *** 
-        setupUI(scene);
-
-        // ** Ladrillos iniciales ***
-        spawnPickupBath(scene);
-
-
-
-        // *** INPUT (WASD + E) ***
-        const inputMap = {};
-        scene.metadata.inputMap = inputMap;
-
-        // Observador de teclado (keydown / keyup)
-        scene.onKeyboardObservable.add((kbinfo) => {
-            const key = kbinfo.event.key.toLowerCase();
-
-            switch (kbinfo.type) {
-                case BABYLON.KeyboardEventTypes.KEYDOWN:
-                    inputMap[key] = true;
-
-                    // Tecla de acción 'E'
-                    if (key === 'e') {
-                        handleBrickAction(scene); // Interacción con ladrillos
-                    } else if (key === 'f') {
-                        handleWheelBarrowAction(scene); // Interacción con carretilla
-                    }
-                    break;
-                case BABYLON.KeyboardEventTypes.KEYUP:
-                    inputMap[key] = false;
-                    break;
-            }
-        });
-
-
-        // *** UPDATE POR FRAME ***
-        scene.onBeforeRenderObservable.add(() => {
-            const game = scene.metadata.game;
-            const { player, state } = game;
-
-            let moveForward = 0
-            let rotateDir = 0;
-
-            if (inputMap['w']) moveForward += 1;
-            if (inputMap['s']) moveForward -= 1;
-            if (inputMap['a']) rotateDir -= 1;
-            if (inputMap['d']) rotateDir += 1;
-
-            if (!state.isGameOver) {
-                // Rotación del player (horizontal)
-                if (rotateDir !== 0) {
-                    player.rotation.y += rotateDir * ROT_SPEED;
-                }
-
-                // Avanzar / retroceder en la dirección actual (en la que mira)
-                if (moveForward !== 0) {
-                    const speed = state.isPushingWheelbarrow ? MOVE_SPEED_PUSHING : MOVE_SPEED;
-                    const yaw = player.rotation.y;
-                    const dirX = Math.sin(yaw);
-                    const dirZ = Math.cos(yaw);
-
-                    player.position.x += dirX * moveForward * speed;
-                    player.position.z += dirZ * moveForward * speed;
-                }
-            }
-            updateHUD(scene); // Actualizar HUD cada frame
-        });
-
-        // *** FUNCIÓN DE ACCIÓN / AUXILIARES ***
-        function isFacing(player, targetPos, thresholdDot = 0.7) {
-            // Vector desde el jugador hacia el objetivo (solo en XZ)
-            const toTarget = targetPos.subtract(player.position);
-            toTarget.y = 0;
-            if (toTarget.lengthSquared() === 0) return true;
-            toTarget.normalize();
-
-            // Vector “forward” del jugador según su rotación Y
-            const yaw = player.rotation.y;
-            const forward = new BABYLON.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
-            forward.normalize();
-
-            const dot = BABYLON.Vector3.Dot(forward, toTarget);
-            // dot = 1 → exactamente de frente, 0 → perpendicular, -1 → de espaldas
-            return dot >= thresholdDot; // ~cos(45°), puedes subir/bajar el 0.7
-        }
-
-
-        function spawnPickupBath(scene) {
-            const game = scene.metadata.game;
-            const { pickupZone, pickupBricks, state } = game;
-
-            if (state.totalDelivered >= state.targetBricks) return;
-
-            const count = state.batchSize;
-            const baseX = pickupZone.position.x;
-            const baseZ = pickupZone.position.z;
-            const offset = 0.7;
-
-            for (let i = 0; i < count; i++) {
-                const brick = BABYLON.MeshBuilder.CreateBox(
-                    `pickupBrick_${state.brickIdCounter++}`,
-                    {
-                        width: 0.6,
-                        height: 0.3,
-                        depth: 0.3
-                    },
-                    scene
-                );
-                brick.material = brickMat;
-                brick.position = new BABYLON.Vector3(
-                    baseX + (i - (count - 1) / 2) * offset,
-                    baseWallY,
-                    baseZ
-                );
-                pickupBricks.push(brick);
-            }
-        }
-
-        function computeDistances(game) {
-            const playerPos = game.player.position;
-            const wheelPos = game.wheelbarrow.getAbsolutePosition();
-            const pickupPos = game.pickupZone.position;
-            const dropoffPos = game.dropoffZone.position;
-
-            return {
-                playerWheel: BABYLON.Vector3.Distance(playerPos, wheelPos),
-                wheelPickup: BABYLON.Vector3.Distance(wheelPos, pickupPos),
-                wheelDrop: BABYLON.Vector3.Distance(wheelPos, dropoffPos),
-            };
-        }
-
-        function handleWheelBarrowAction(scene) {
-            const game = scene.metadata.game;
-            const { player, wheelbarrow, state } = game;
-            if (state.isGameOver) return;
-
-            const dists = computeDistances(game);
-
-            // Si ya la está empujando, soltarla en cualquier lugar
-            if (state.isPushingWheelbarrow) {
-                const worldPos = wheelbarrow.getAbsolutePosition().clone();
-                wheelbarrow.setParent(null);
-                wheelbarrow.position = worldPos;
-                state.isPushingWheelbarrow = false;
-                return;
-            }
-
-            // Si NO la está empujando, intentar tomarla si está cerca
-            if (dists.playerWheel < ACTION_DISTANCE) {
-                wheelbarrow.setParent(player);
-                wheelbarrow.rotation.y = 0; // Alinear con el player
-                wheelbarrow.position = new BABYLON.Vector3(0, 0.3, 1.5);
-                state.isPushingWheelbarrow = true;
-            }
-        }
-
-        function handleBrickAction(scene) {
-            const game = scene.metadata.game;
-            const {
-                player,
-                pickupZone,
-                dropoffZone,
-                wheelbarrow,
-                pickupBricks,
-                bricksOnWheelbarrow,
-                deliveredBricks,
-                state
-            } = game;
-
-            if (state.isGameOver) return;
-            if (!state.isPushingWheelbarrow) return; // Solo con carretilla
-
-            const dists = computeDistances(game);
-
-            // 1. Intentar recoger ladrillos
-            if (
-                dists.wheelPickup < ACTION_DISTANCE &&
-                bricksOnWheelbarrow.length < state.maxBricksOnWheelbarrow &&
-                pickupBricks.length > 0 &&
-                isFacing(player, pickupZone.position) // NUEVO: debe estar mirando a la pila
-            ) {
-                const brick = pickupBricks.shift();
-                brick.setParent(wheelbarrow);
-
-                const slotIndex = bricksOnWheelbarrow.length;
-                const slots = [
-                    new BABYLON.Vector3(-0.4, 0.4, 0),
-                    new BABYLON.Vector3(0, 0.4, 0),
-                    new BABYLON.Vector3(0.4, 0.4, 0)
-                ];
-                brick.position = slots[slotIndex] || new BABYLON.Vector3(0, 0.4, 0);
-                bricksOnWheelbarrow.push(brick);
-                return;
-            }
-
-            // 2. Intentar entregar ladrillos
-            if (
-                dists.wheelDrop < ACTION_DISTANCE &&
-                bricksOnWheelbarrow.length > 0 &&
-                isFacing(player, dropoffZone.position) // NUEVO: debe estar mirando a la pared / zona de entrega
-            ) {
-                const brick = bricksOnWheelbarrow.pop();
-                brick.setParent(null);
-
-                const cfg = game.deliveredWallConfig; // Configuración de la pared entregada
-                const index = state.totalDelivered; // Índice del ladrillo a entregar
-                const row = Math.floor(index / cfg.bricksPerRow); // Fila en Y
-                const col = index % cfg.bricksPerRow;          // Columna en Z
-
-                //MISMO EJE Z QUE EL MURO DECORATIVO, CONTINUANDO HACIA +Z
-                brick.position = new BABYLON.Vector3(
-                    cfg.baseX,
-                    cfg.baseY + row * cfg.rowHeight,
-                    cfg.startZ + col * cfg.colStep
-                );
-                brick.rotation.y = Math.PI / 2; // Girar 90 grados para alinear con el muro
-
-                deliveredBricks.push(brick);
-                state.totalDelivered++;
-
-                checkProgress(scene);
-            }
-        }
-
-        function checkProgress(scene) {
-            const game = scene.metadata.game;
-            const { pickupBricks, bricksOnWheelbarrow, state } = game;
-
-            if (state.totalDelivered >= state.targetBricks) {
-                state.isGameOver = true;
-                return;
-            }
-
-            const noActiveBricks = pickupBricks.length === 0 && bricksOnWheelbarrow.length === 0;
-
-            if (
-                noActiveBricks &&
-                state.totalDelivered > 0 &&
-                state.totalDelivered < state.targetBricks &&
-                state.totalDelivered % state.batchSize === 0
-            ) {
-                spawnPickupBath(scene);
-            }
-        }
-
-        function setupUI(scene) {
-            if (!BABYLON.GUI || !BABYLON.GUI.AdvancedDynamicTexture) {
-                console.warn('Babylon GUI no está disponible, el HUD no se mostrará.');
-                return;
-            }
-
-            const uiTex = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI(
-                'UI',
-                true,
-                scene
-            );
-
-            const panel = new BABYLON.GUI.StackPanel();
-            panel.width = "30%";
-            panel.isVertical = true;
-            panel.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
-            panel.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
-            panel.paddingTop = "10px";
-            panel.paddingLeft = "10px";
-            uiTex.addControl(panel);
-
-            const hudCounter = new BABYLON.GUI.TextBlock("hudCounter");
-            hudCounter.text = "";
-            hudCounter.color = "rgb(16, 16, 197)";
-            hudCounter.fontSize = 20;
-            hudCounter.height = "30px";
-            hudCounter.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
-            panel.addControl(hudCounter);
-
-            const hudHint = new BABYLON.GUI.TextBlock("hudHint");
-            hudHint.text = "";
-            hudHint.color = "rgb(16, 16, 197)";
-            hudHint.fontSize = 16;
-            hudHint.height = "100px";
-            hudHint.textWrapping = true;
-            hudHint.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
-            panel.addControl(hudHint);
-
-            scene.metadata.ui = {
-                uiTex,
-                hudCounter,
-                hudHint
-            };
-        }
-
-        function updateHUD(scene) {
-            const ui = scene.metadata.ui;
-            const game = scene.metadata.game;
-            if (!ui || !ui.hudCounter || !ui.hudHint) return;
-
-            const { hudCounter, hudHint } = ui;
-            const { state, bricksOnWheelbarrow, pickupBricks } = game;
-
-            const delivered = state.totalDelivered;
-            const remaining = Math.max(0, state.targetBricks - delivered);
-
-            hudCounter.text =
-                `Ladrillos entregados: ${delivered} / ${state.targetBricks}` +
-                ` | En carretilla: ${bricksOnWheelbarrow.length}` +
-                ` | Faltan: ${remaining}`;
-
-            if (state.isGameOver) {
-                hudHint.text =
-                    "Juego finalizado 🎉 Has apilado los 9 ladrillos y completado la pared.";
-                return;
-            }
-
-            const dists = computeDistances(game);
-            let hint = "W/S: avanzar/retroceder \nA/D: girar \nF: tomar/soltar carretilla \nE: interactuar con ladrillos";
-
-            if (!state.isPushingWheelbarrow && dists.playerWheel < ACTION_DISTANCE) {
-                hint = "Estás cerca de la carretilla. Pulsa F para tomarla.";
-            } else if (state.isPushingWheelbarrow) {
-                const facingPickup = isFacing(game.player, game.pickupZone.position);
-                const facingDrop = isFacing(game.player, game.dropoffZone.position);
-
-                if (
-                    dists.wheelPickup < ACTION_DISTANCE &&
-                    bricksOnWheelbarrow.length < state.maxBricksOnWheelbarrow &&
-                    pickupBricks.length > 0
-                ) {
-                    if (facingPickup) {
-                        hint =
-                            "Carretilla en zona de recogida y de frente. Pulsa E para cargar un ladrillo (máx. 3).";
-                    } else {
-                        hint =
-                            "Carretilla en zona de recogida. Gira con A/D para mirar la pila y luego pulsa E.";
-                    }
-                } else if (
-                    dists.wheelDrop < ACTION_DISTANCE &&
-                    bricksOnWheelbarrow.length > 0
-                ) {
-                    if (facingDrop) {
-                        hint =
-                            "Carretilla en zona de entrega y de frente. Pulsa E para descargar un ladrillo en la pared.";
-                    } else {
-                        hint =
-                            "Carretilla en zona de entrega. Gira con A/D para mirar la pared y luego pulsa E.";
-                    }
-                } else {
-                    hint =
-                        "Empujando carretilla. F: soltar en cualquier momento. Acércate a zonas y mira hacia ellas para usar E.";
-                }
-            }
-
-
-            hudHint.text = hint;
-        }
-
-        return scene;
+    // 2) Colisión con carretilla (solo si NO la estamos empujando)
+    if (!state.isPushingWheelbarrow) {
+      const wbPos = game.wheelbarrowNode.position;
+
+      // Distancia actual del player a la carretilla
+      const curPos = game.playerNode.position;
+      const curDx = curPos.x - wbPos.x;
+      const curDz = curPos.z - wbPos.z;
+      const curDist2 = curDx * curDx + curDz * curDz;
+
+      // Distancia con el nuevo movimiento propuesto
+      const newDx = newPos.x - wbPos.x;
+      const newDz = newPos.z - wbPos.z;
+      const newDist2 = newDx * newDx + newDz * newDz;
+
+      const minDist = PLAYER_RADIUS + WHEELBARROW_RADIUS;
+      const minDist2 = minDist * minDist;
+
+      // Solo bloqueamos si:
+      // - el nuevo punto está dentro del radio
+      // - y además nos estamos ACERCANDO (distancia nueva < actual)
+      if (newDist2 < minDist2 && newDist2 < curDist2) {
+        return false;
+      }
+    }
+
+    // 3) Colisión con objetos "sólidos": ladrillos + paredes completas
+    const solidObjects = [
+      ...(game.decorWallBricks || []),
+      ...(game.pickupDecorBricks || []),
+      ...(game.deliveredBricks || []),
+      ...(game.decorFullWalls || []),   // ⬅️ nuevas paredes completas
+    ];
+
+    for (const obj of solidObjects) {
+      if (!obj || !obj.isEnabled()) continue;
+
+      obj.computeWorldMatrix(true);
+      const bbox = obj.getBoundingInfo().boundingBox;
+      const min = bbox.minimumWorld;
+      const max = bbox.maximumWorld;
+
+      const minX = min.x - PLAYER_RADIUS;
+      const maxX = max.x + PLAYER_RADIUS;
+      const minZ = min.z - PLAYER_RADIUS;
+      const maxZ = max.z + PLAYER_RADIUS;
+
+      if (
+        newPos.x >= minX && newPos.x <= maxX &&
+        newPos.z >= minZ && newPos.z <= maxZ
+      ) {
+        return false;
+      }
+    }
+
+
+    return true;
+  }
+
+  // ──────── HELPER RESTART ────────
+  function resetGame(scene) {
+    const game = scene.metadata.game;
+    const state = game.state;
+
+    // 1) Limpiar ladrillos interactivos actuales
+    const allInteractive = [
+      ...(game.pickupBricks || []),
+      ...(game.bricksOnWheelbarrow || []),
+      ...(game.deliveredBricks || []),
+    ];
+
+    allInteractive.forEach((brick) => {
+      if (brick && !brick.isDisposed()) {
+        brick.dispose();
+      }
+    });
+
+    game.pickupBricks = [];
+    game.bricksOnWheelbarrow = [];
+    game.deliveredBricks = [];
+
+    // 2) Resetear estado
+    state.isPushingWheelbarrow = false;
+    state.totalDelivered = 0;
+    state.isGameOver = false;
+
+    // 3) Resetear posición y rotación del jugador y la carretilla
+    const player = game.playerNode;
+    const wheelbarrow = game.wheelbarrowNode;
+
+    player.position.set(0, 0, 0);
+    player.rotation.y = 0;
+
+    wheelbarrow.position.set(-4, 0, -2);
+    wheelbarrow.rotation.y = 0;
+
+    // 4) Generar nueva tanda de ladrillos en la zona de recogida
+    spawnPickupBricks(scene);
+  }
+
+  // ──────── HELPER SOBRAS LADRILLOS ────────
+
+  function registerBrickShadow(brick, scene) {
+    const lights = scene.metadata.lights;
+    if (!lights || !lights.shadowGenerator) return;
+
+    const sg = lights.shadowGenerator;
+    // includeDescendants = true por si el modelo tiene hijos
+    sg.addShadowCaster(brick, true);
+  }
+
+
+  // ───────────────────── CREACIÓN DE ESCENA ─────────────────────
+
+  const createScene = function () {
+    const scene = new BABYLON.Scene(engine);
+    // scene.clearColor = new BABYLON.Color4(0.9, 0.9, 0.95, 1.0);
+    scene.clearColor = new BABYLON.Color4(0.8, 0.9, 1.0, 1.0);
+
+    // SUELO
+    const ground = BABYLON.MeshBuilder.CreateGround(
+      "ground",
+      { width: 40, height: 40, subdivisions: 4 }, // subdivisions para mejor calidad de luz
+      scene
+    );
+    const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
+    groundMat.diffuseColor = new BABYLON.Color3(0.6, 0.55, 0.5);
+    groundMat.specularColor = new BABYLON.Color3(0, 0, 0);
+    groundMat.emissiveColor = new BABYLON.Color3(0.02, 0.02, 0.02);
+    ground.material = groundMat;
+
+    // Resivir sombras
+    ground.receiveShadows = true;
+
+    // Paredes de Borde (Primitivas)
+    const borderWalls = [];
+    const wallHeight = 2.5;
+    const wallThickness = 0.3;
+    const halfSize = 20; // tu ground es 40x40 → va de -20 a +20
+
+    const borderMat = new BABYLON.StandardMaterial("borderWallMat", scene);
+    borderMat.diffuseColor = new BABYLON.Color3(0.9, 0.9, 0.9);
+    borderMat.specularColor = new BABYLON.Color3(0.5, 0.5, 0.5);
+
+    // Norte (parte "atrás")
+    const northWall = BABYLON.MeshBuilder.CreateBox("borderNorth", {
+      width: 2 * halfSize,
+      height: wallHeight,
+      depth: wallThickness,
+    }, scene);
+    northWall.position = new BABYLON.Vector3(0, wallHeight / 2, -halfSize);
+    northWall.material = borderMat;
+    northWall.isPickable = false;
+    borderWalls.push(northWall);
+
+    // Sur (parte "delante")
+    const southWall = northWall.clone("borderSouth");
+    southWall.position.z = halfSize;
+    borderWalls.push(southWall);
+
+    // Oeste (izquierda)
+    const westWall = BABYLON.MeshBuilder.CreateBox("borderWest", {
+      width: wallThickness,
+      height: wallHeight,
+      depth: 2 * halfSize,
+    }, scene);
+    westWall.position = new BABYLON.Vector3(-halfSize, wallHeight / 2, 0);
+    westWall.material = borderMat;
+    westWall.isPickable = false;
+    borderWalls.push(westWall);
+
+    // Este (derecha)
+    const eastWall = westWall.clone("borderEast");
+    eastWall.position.x = halfSize;
+    borderWalls.push(eastWall);
+
+    // DEBUG: EJES TEMPORALES
+    // Muestra ejes X (rojo), Y (verde), Z (azul) en el origen (0,0,0)
+    // const axes = new BABYLON.AxesViewer(scene, 3);
+
+    // NODOS LÓGICOS (no son figuras, solo "pivotes")
+    const playerNode = new BABYLON.TransformNode("playerNode", scene);
+    playerNode.position = new BABYLON.Vector3(0, 0, 0);
+
+    const wheelbarrowNode = new BABYLON.TransformNode("wheelbarrowNode", scene);
+    wheelbarrowNode.position = new BABYLON.Vector3(-4, 0, -2);
+
+    // ZONA DE RECOGIDA Y ENTREGA DE LADRILLOS
+    const pickupZone = BABYLON.MeshBuilder.CreateBox(
+      "pickupZone",
+      { width: 4, height: 0.1, depth: 4 },
+      scene
+    );
+    pickupZone.position = new BABYLON.Vector3(-8, 0.05, 5);
+    const pickupMat = new BABYLON.StandardMaterial("pickupMat", scene);
+    pickupMat.diffuseColor = new BABYLON.Color3(0.3, 0.8, 0.3);
+    pickupMat.alpha = 0.1;
+    pickupZone.material = pickupMat;
+
+    const dropZone = BABYLON.MeshBuilder.CreateBox(
+      "dropZone",
+      { width: 4, height: 0.1, depth: 4 },
+      scene
+    );
+    dropZone.position = new BABYLON.Vector3(8, 0.05, -5);
+    const dropMat = new BABYLON.StandardMaterial("dropMat", scene);
+    dropMat.diffuseColor = new BABYLON.Color3(0.9, 0.8, 0.3);
+    dropMat.alpha = 0.1;
+    dropZone.material = dropMat;
+
+    // ILUMINACIÓN
+    // Luz hemisférica (cielo y suelo)
+    const hemiLight = new BABYLON.HemisphericLight(
+      "hemiLight",
+      new BABYLON.Vector3(0, 1, 0),
+      scene
+    );
+    hemiLight.intensity = 0.5;
+    hemiLight.groundColor = new BABYLON.Color3(0.1, 0.1, 0.12);
+
+    // Luz direccional (sol)
+    const sunLight = new BABYLON.DirectionalLight(
+      "sunLight",
+      new BABYLON.Vector3(-0.5, -1, -0.4),
+      scene
+    );
+    sunLight.position = new BABYLON.Vector3(20, 30, 20);
+    sunLight.intensity = 0.9;
+
+    // Sombras
+    const shadowGenerator = new BABYLON.ShadowGenerator(2048, sunLight);
+    shadowGenerator.useExponentialShadowMap = true;
+
+    // CÁMARA 3ª PERSONA (orbitando el playerNode)
+    const cam3p = new BABYLON.ArcRotateCamera(
+      "cam3p",
+      Math.PI * 1.25,          // ángulo horizontal
+      Math.PI / 3,             // ángulo vertical
+      30,                      // radio
+      playerNode.position,     // target (mismo vector de posición)
+      scene
+    );
+    cam3p.attachControl(canvas, true);
+    // Ajustes básicos
+    cam3p.lowerRadiusLimit = 6;
+    cam3p.upperRadiusLimit = 40;
+    // Limites verticales (ángulo polar)
+    cam3p.lowerBetaLimit = 0.2;                  // no dejarla totalmente zenital
+    cam3p.upperBetaLimit = Math.PI / 2.1;        // ≈ un poco más que 90°
+
+
+
+    // CÁMARA 1ª PERSONA (pegada al "head" del playerNode)
+    const fpCam = new BABYLON.FreeCamera(
+      "fpCam",
+      new BABYLON.Vector3(5, 1.75, 0.15), // posición inicial (se recalcula por el parent)
+      scene
+    );
+    // La cámara se mueve con el playerNode
+    fpCam.parent = playerNode;
+    fpCam.position = new BABYLON.Vector3(0, 1.75, 0.15); // altura aprox. de los ojos
+    // Ajustes básicos
+    fpCam.minZ = 0.1;                         // plano cercano
+    fpCam.speed = 0.6;                        // velocidad de movimiento
+    fpCam.inertia = 0.7;                      // suavizado al mover
+    fpCam.fov = BABYLON.Tools.ToRadians(75);  // campo de visión
+
+    fpCam.checkCollisions = false;
+    fpCam.applyGravity = false;
+
+    // Metadatos básicos (para usar luego con lógica del juego)
+    scene.metadata = {
+      game: {
+        ground,
+        playerNode,
+        wheelbarrowNode,
+        pickupZone,
+        dropZone,
+        pickupBricks: [], // ladrillos disponibles para recoger
+        bricksOnWheelbarrow: [], // ladrillos actualmente en la carretilla
+        deliveredBricks: [], // ladrillos ya entregados
+        decorWallBricks: [], // ladrillos usados para el muro decorativo
+        pickupDecorBricks: [], // ladrillos para el muro decorativo (zona de recogida)
+        decorFullWalls: [], // paredes completas
+        borderWalls,
+        state: {
+          isPushingWheelbarrow: false,
+          totalDelivered: 0,
+          targetBricks: TARGET_BRICKS,
+          isGameOver: false,
+        },
+      },
+      camera: {
+        mode: "third", // "first" | "third"
+        cam3p,
+        fpCam,
+      },
+      models: {
+        playerRoot: null,
+        playerAnimGroups: [],
+        wheelbarrowRoot: null,
+        brickTemplate: null,
+        wallTemplate: null,
+        animIdle: null,
+        animWalk: null,
+        currentAnim: null,
+      },
+      input: {
+        forward: false,
+        back: false,
+        left: false,
+        right: false,
+      },
+      lights: {
+        hemiLight,
+        sunLight,
+        shadowGenerator,
+      },
     };
 
-    const scene = createScene();
+    // ──────────────────── HUD (Babylon GUI) ────────────────────
+    let ui = null;
 
-    engine.runRenderLoop(function () {
-        if (scene) { scene.render(); }
+    if (BABYLON.GUI) {
+      const advancedTexture = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI(
+        "UI",
+        true,
+        scene
+      );
+
+      // Contenedor semi-transparente (arriba a la izquierda)
+      const infoContainer = new BABYLON.GUI.Rectangle("infoContainer");
+      infoContainer.width = "280px";
+      infoContainer.height = "130px";
+      infoContainer.cornerRadius = 10;
+      infoContainer.thickness = 0;          // sin borde
+      infoContainer.background = "rgba(237, 237, 243, 1)";   // color de fondo
+      infoContainer.alpha = 0.6;            // semitransparente
+      infoContainer.horizontalAlignment =
+        BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+      infoContainer.verticalAlignment =
+        BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+      infoContainer.paddingLeft = "10px";
+      infoContainer.paddingTop = "10px";
+      advancedTexture.addControl(infoContainer);
+
+      // Texto principal (arriba a la izquierda)
+      const infoText = new BABYLON.GUI.TextBlock();
+      infoText.text = "";
+      infoText.color = "rgba(39, 35, 224, 1)";
+      infoText.fontSize = 18;
+      infoText.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+      infoText.textVerticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+      infoText.paddingLeft = "20px";
+      infoText.paddingTop = "20px";
+      advancedTexture.addControl(infoText);
+
+      // Contenedor de acciones (abajo en el centro)
+      const actionContainer = new BABYLON.GUI.Rectangle("actionContainer");
+      actionContainer.width = "480px";
+      actionContainer.height = "50px";
+      actionContainer.cornerRadius = 10;
+      actionContainer.thickness = 0;
+      actionContainer.background = "rgba(202, 228, 110, 1)";
+      actionContainer.alpha = 0.6;
+      actionContainer.horizontalAlignment =
+        BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+      actionContainer.verticalAlignment =
+        BABYLON.GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+      actionContainer.paddingBottom = "20px";
+      advancedTexture.addControl(actionContainer);
+
+      // Texto de acciones (abajo en el centro)
+      const actionText = new BABYLON.GUI.TextBlock();
+      actionText.text = "";
+      actionText.color = "rgba(0, 0, 0, 1)";
+      actionText.fontSize = 20;
+      actionText.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+      actionText.textVerticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+      actionText.paddingBottom = "25px";
+      advancedTexture.addControl(actionText);
+
+      ui = {
+        advancedTexture,
+        infoText,
+        actionText,
+      };
+    } else {
+      console.warn("Babylon GUI no está disponible, el HUD no se mostrará.");
+    }
+
+    scene.metadata.ui = ui;
+
+
+    // Cargar modelos .glb
+    loadModels(scene);
+
+    // ───────────────────── FUNCIONES HELPER ─────────────────────
+    // Cambia a cámara en 3ª persona
+    function switchToThirdPerson() {
+      const camState = scene.metadata.camera;
+
+      if (scene.activeCamera === camState.cam3p) return;
+
+      if (scene.activeCamera) {
+        scene.activeCamera.detachControl(canvas);
+      }
+
+      camState.mode = "third";
+      scene.activeCamera = camState.cam3p;
+      scene.activeCamera.attachControl(canvas, true);
+      // Por si salimos de pointer lock
+      if (document.exitPointerLock && document.pointerLockElement === canvas) {
+        document.exitPointerLock();
+      }
+    }
+
+    // Cambia a cámara en 1ª persona
+    function switchToFirstPerson() {
+      const camState = scene.metadata.camera;
+
+      if (scene.activeCamera === camState.fpCam) return;
+
+      if (scene.activeCamera) {
+        scene.activeCamera.detachControl(canvas);
+      }
+
+      camState.mode = "first";
+      scene.activeCamera = camState.fpCam;
+      scene.activeCamera.attachControl(canvas, true);
+    }
+
+    // Sincronizar orientación del player con la cámara 1ª persona
+    function updatePlayerAnimation(isMoving) {
+      const models = scene.metadata.models;
+      const groups = models.playerAnimGroups;
+      if (!groups || groups.length === 0) return;
+
+      const desired = isMoving ? "walk" : "idle";
+      if (models.currentAnim === desired) return;
+
+      // Para Todo
+      groups.forEach((ag) => ag.stop());
+
+      let target = null;
+      if (desired === "walk") {
+        target = models.animWalk || models.animIdle || groups[0];
+      } else {
+        target = models.animIdle || models.animWalk || groups[0];
+      }
+
+      if (target) {
+        target.reset(); // desde el inicio
+        target.start(true); // loop
+      }
+
+      models.currentAnim = desired;
+    }
+
+    const INTERACT_DISTANCE = 2.5; // distancia para interactuar con la carretilla
+
+    // Función para tomar/soltar carretilla (tecla "f")
+    function handleWheelbarrowTogle() {
+      const game = scene.metadata.game;
+      const { playerNode, wheelbarrowNode, state } = game;
+
+      if (state.isGameOver) return;
+
+      const dist = BABYLON.Vector3.Distance(
+        playerNode.position,
+        wheelbarrowNode.position
+      );
+
+      if (!state.isPushingWheelbarrow) {
+        // Intentar tomar la carretilla
+        if (dist <= INTERACT_DISTANCE) {
+          state.isPushingWheelbarrow = true;
+          // Opcional: pequeño "snap" inicial delante del player
+          const yaw = playerNode.rotation.y;
+          const forward = new BABYLON.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+          const offset = 2.0; // distancia delante del player
+          wheelbarrowNode.position = playerNode.position.add(
+            forward.scale(offset)
+          );
+          wheelbarrowNode.position.y = 0; // asegurar en suelo
+          wheelbarrowNode.rotation.y = playerNode.rotation.y;
+        }
+      } else {
+        // Soltar la carretilla
+        game.state.isPushingWheelbarrow = false;
+      }
+    }
+
+    // Función para la interacción de ladrillos (tecla "e")
+    function handleBrickAction() {
+      const game = scene.metadata.game;
+      const models = scene.metadata.models;
+
+      const { playerNode, wheelbarrowNode, pickupZone, dropZone } = game;
+      const { pickupBricks, bricksOnWheelbarrow, deliveredBricks, state } = game;
+
+      if (state.isGameOver) return;
+
+      if (!state.isPushingWheelbarrow) {
+        // Sólo interactuamos con ladrillos si estamos empujando la carretilla
+        return;
+      }
+      if (!models.brickTemplate) return;
+
+      const distPickup = BABYLON.Vector3.Distance(
+        wheelbarrowNode.position,
+        pickupZone.position
+      );
+      const distDrop = BABYLON.Vector3.Distance(
+        wheelbarrowNode.position,
+        dropZone.position
+      );
+
+      // 1) CARGAR ladrillos en la carretilla (zona de recogida)
+      if (
+        distPickup < ACTION_DISTANCE &&
+        bricksOnWheelbarrow.length < MAX_BRICKS_ON_WHEELBARROW &&
+        pickupBricks.length > 0
+      ) {
+        const brick = pickupBricks.shift();  // sacamos uno de la zona
+
+        // Lo añadimos a la lista "lógica" de la carretilla
+        game.bricksOnWheelbarrow.push(brick);
+
+        // Dejamos que una sola función decida posiciones/orientaciones
+        layoutBricksOnWheelbarrow(scene);
+
+        return;
+      }
+
+      // 2) DESCARGAR ladrillos en la zona de entrega
+      if (distDrop < ACTION_DISTANCE && bricksOnWheelbarrow.length > 0) {
+        const brick = bricksOnWheelbarrow.pop();
+        brick.setParent(null); // ya no sigue a la carretilla
+
+        resetBrickTransform(brick, scene);
+
+        const index = state.totalDelivered; // 0..N-1
+        const bricksPerRow = 3;
+        const row = Math.floor(index / bricksPerRow);
+        const col = index % bricksPerRow;
+
+        const baseX = dropZone.position.x;
+        const baseZ = dropZone.position.z;
+        const rowHeight = 0.175;  // altura entre filas de ladrillos
+        const colStep = 0.62;    // separación horizontal
+
+        brick.position = new BABYLON.Vector3(
+          baseX + 3,
+          row * rowHeight,                      // altura por fila
+          baseZ + (col - 1) * colStep           // centrado en la zona
+        );
+
+        deliveredBricks.push(brick);
+        state.totalDelivered++;
+
+        // Registrar sombra
+        registerBrickShadow(brick, scene);
+
+        // Comprobar si se ha alcanzado el objetivo
+        if (state.totalDelivered >= state.targetBricks) {
+          state.isGameOver = true;
+        }
+
+        layoutBricksOnWheelbarrow(scene);
+
+        // Opcional: cuando se haya entregado un múltiplo de 3 y aún hay objetivo → respawn
+        if (
+          state.totalDelivered < state.targetBricks &&
+          pickupBricks.length === 0 &&
+          bricksOnWheelbarrow.length === 0 &&
+          state.totalDelivered % PICKUP_BATCH_SIZE === 0
+        ) {
+          spawnPickupBricks(scene);
+        }
+      }
+    }
+
+    // Función para actualizar el HUD
+    function updateHud() {
+      const ui = scene.metadata.ui;
+      if (!ui) return;
+
+      const game = scene.metadata.game;
+      const { state, pickupBricks, bricksOnWheelbarrow } = game;
+
+      const remaining = Math.max(
+        0,
+        state.targetBricks - state.totalDelivered
+      );
+
+      // Texto de estado (arriba izquierda)
+      ui.infoText.text =
+        `Ladrillos en carretilla: ${bricksOnWheelbarrow.length}/${MAX_BRICKS_ON_WHEELBARROW}\n` +
+        `Ladrillos entregados: ${state.totalDelivered}/${state.targetBricks}\n` +
+        `Ladrillos en zona de recogida: ${pickupBricks.length}\n` +
+        (state.isGameOver ? "¡Muro terminado! 🎉" : "") +
+        `\n` +
+        `R: Reiniciar juego\n`;
+
+      // Texto de acciones (abajo)
+      let actions = [];
+
+      // F siempre es relevante si la carretilla está cerca
+      const player = game.playerNode;
+      const wheelbarrow = game.wheelbarrowNode;
+      const distPlayerWheel = BABYLON.Vector3.Distance(
+        player.position,
+        wheelbarrow.position
+      );
+      if (distPlayerWheel < ACTION_DISTANCE) {
+        actions.push("F: Tomar / soltar carretilla");
+      }
+
+      // E depende de si estamos empujando y de la zona
+      if (!state.isGameOver && state.isPushingWheelbarrow) {
+        const distPickup = BABYLON.Vector3.Distance(
+          wheelbarrow.position,
+          game.pickupZone.position
+        );
+        const distDrop = BABYLON.Vector3.Distance(
+          wheelbarrow.position,
+          game.dropZone.position
+        );
+
+        if (
+          distPickup < ACTION_DISTANCE &&
+          pickupBricks.length > 0 &&
+          bricksOnWheelbarrow.length < MAX_BRICKS_ON_WHEELBARROW
+        ) {
+          actions.push("E: Cargar ladrillo");
+        }
+
+        if (
+          distDrop < ACTION_DISTANCE &&
+          bricksOnWheelbarrow.length > 0
+        ) {
+          actions.push("E: Descargar ladrillo");
+        }
+      }
+
+      ui.actionText.text = actions.join("   ·   ");
+    }
+
+    // Empezar en cámara 3ª persona
+    switchToThirdPerson();
+
+    // ───────────────────── KEYBOARD INPUTS ─────────────────────
+    const input = scene.metadata.input;
+    const camState = scene.metadata.camera;
+
+    // Toggle entre cámara 1ª y 3ª persona (tecla 'v') y movimiento WASD
+    scene.onKeyboardObservable.add((kbInfo) => {
+      const key = kbInfo.event.key.toLowerCase();
+      const isDown = kbInfo.type === BABYLON.KeyboardEventTypes.KEYDOWN;
+
+      switch (key) {
+        case "w":
+          input.forward = isDown;
+          break;
+        case "s":
+          input.back = isDown;
+          break;
+        case "a":
+          input.left = isDown;
+          break;
+        case "d":
+          input.right = isDown;
+          break;
+        case "v":
+          if (isDown) {
+            if (camState.mode === "third") {
+              switchToFirstPerson();
+            } else {
+              switchToThirdPerson();
+            }
+          }
+          break;
+        case "f":
+          if (isDown) {
+            handleWheelbarrowTogle();
+          }
+          break;
+        case "e":
+          if (isDown) {
+            handleBrickAction();
+          }
+          break;
+        case "r":
+          if (isDown) resetGame(scene);   // ⬅️ RESET
+          break;
+      }
     });
 
-    window.addEventListener('resize', function () {
-        engine.resize();
+    // Pointer lock en cámara 1ª persona al hacer click
+    scene.onPointerDown = function () {
+      const camState = scene.metadata.camera;
+      if (camState.mode === "first") {
+        if (canvas.requestPointerLock) {
+          canvas.requestPointerLock();
+        }
+      }
+    };
+
+    // Update loop
+    scene.onBeforeRenderObservable.add(() => {
+      const dt = scene.getEngine().getDeltaTime() / 1000; // segundos
+      const game = scene.metadata.game;
+      const camState = scene.metadata.camera;
+      const input = scene.metadata.input;
+
+      const player = game.playerNode;
+      const wheelbarrow = game.wheelbarrowNode;
+      const state = game.state;
+
+      // Si el juego terminó, no actualizamos movimiento ni carretilla
+      if (state.isGameOver) {
+        updateHud();
+        return;
+      }
+
+      // 1. Si esta en 1ª persona, sincronizar yaw del player con la cámara
+      if (camState.mode === "first" && camState.fpCam) {
+        const cam = camState.fpCam;
+
+        // Solo yaw (eje Y)
+        const yawDelta = cam.rotation.y;
+
+        if (Math.abs(yawDelta) > 1e-4) {
+          player.rotation.y += yawDelta;
+          // Reset rotación cámara para evitar acumulación
+          cam.rotation.y = 0;
+        }
+        // Pitch (eje X) se mantiene en la cámara, el cuerpo no se inclina
+      }
+
+      // 2. Movimiento básico del player con WASD tipo TANK (sobre playerNode)
+      const moveSpeed = 4;    // unidades por segundo
+      const turnSpeed = 2.5;  // radianes por segundo
+
+      let turn = 0;
+      if (input.left) turn -= 1;
+      if (input.right) turn += 1;
+      player.rotation.y += turn * turnSpeed * dt;
+
+      let move = 0;
+      if (input.forward) move += 1;
+      if (input.back) move -= 1;
+
+      let isMoving = false;
+
+      if (move !== 0) {
+        const yaw = player.rotation.y;
+        const forward = new BABYLON.Vector3(
+          Math.sin(yaw),
+          0,
+          Math.cos(yaw)
+        );
+        const displacement = forward.scale(move * moveSpeed * dt);
+        const newPos = player.position.add(displacement);
+
+        if (canMovePlayerTo(newPos, scene)) {
+          player.position.copyFrom(newPos);
+          isMoving = true;
+        } else {
+          isMoving = false;
+        }
+      }
+
+      // 3. Si está empujando la carretilla, moverla junto al player
+      if (state.isPushingWheelbarrow) {
+        const yaw = player.rotation.y;
+        const forward = new BABYLON.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+
+        const offsetDist = 1.5; // distancia delante del player
+        const targetPos = player.position.add(forward.scale(offsetDist));
+
+        wheelbarrow.position.copyFrom(targetPos);
+        wheelbarrow.position.y = 0; // asegurar en suelo
+        wheelbarrow.rotation.y = player.rotation.y;
+      }
+
+      // 4. Asegurar que la cámara 3ª persona sigue al player
+      if (camState.cam3p && camState.cam3p.lockedTarget !== player) {
+        camState.cam3p.lockedTarget = player;
+      }
+
+      // 5. Actualizar animaciones del player según estado
+      updatePlayerAnimation(isMoving);
+
+      // 6. Actualizar HUD
+      updateHud();
     });
+
+    return scene;
+  };
+
+  const scene = createScene();
+
+  engine.runRenderLoop(function () {
+    if (scene) {
+      scene.render();
+    }
+  });
+
+  window.addEventListener("resize", function () {
+    engine.resize();
+  });
 });
