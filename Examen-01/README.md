@@ -1,6 +1,11 @@
-# Examen-01
+# JUEGOS INTERACTIVOS GR1 #
 
-Estructura inicial del proyecto clonada desde `Clase-003`.
+## Examen 01 ##
+
+Autor: Kevin Asimbaya
+
+
+Estructura inicial del proyecto.
 
 Archivos incluidos:
 - `index.html` — punto de entrada HTML

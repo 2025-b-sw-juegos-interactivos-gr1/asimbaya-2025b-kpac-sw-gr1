@@ -1,5 +1,4 @@
 // main.js
-// Escena base con modelos (player, wheelbarrow, brick) y cámara 3ª persona
 
 // Constantes Globales
 const ACTION_DISTANCE = 2.5; // distancia para interactuar con objetos
